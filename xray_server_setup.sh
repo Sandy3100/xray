@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # xray-server_setup.sh
-# One-shot: install/config Xray VLESS+Reality + generate tool scripts (add/list/del)
+# 一键部署 Xray VLESS+Reality + 自动生成 add/list/del 工具脚本
 set -euo pipefail
 
 ############################
@@ -27,6 +27,8 @@ CFG_DIR="/usr/local/etc/xray"
 CFG_FILE="${CFG_DIR}/config.json"
 REALITY_ENV="${CFG_DIR}/reality.env"
 
+SYSTEMD_SERVICE="/etc/systemd/system/xray.service"
+
 BIN_DIR="/usr/local/sbin"
 ADD_USER_BIN="${BIN_DIR}/xray-reality-add-user"
 LIST_USER_BIN="${BIN_DIR}/xray-reality-list-users"
@@ -38,6 +40,7 @@ need_root() {
     exit 1
   fi
 }
+
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 install_deps() {
@@ -51,9 +54,55 @@ install_xray() {
     echo "[*] 检测到已安装 Xray：$(${XRAY_BIN} version | head -n 1 || true)"
     return
   fi
+
   echo "[*] 安装 Xray-core（官方脚本）..."
   bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)
-  [[ -x "${XRAY_BIN}" ]] || { echo "[!] Xray 安装失败：未找到 ${XRAY_BIN}"; exit 1; }
+
+  if [[ ! -x "${XRAY_BIN}" ]]; then
+    echo "[!] Xray 安装失败：未找到 ${XRAY_BIN}"
+    exit 1
+  fi
+}
+
+patch_xray_service_user_root() {
+  if [[ ! -f "${SYSTEMD_SERVICE}" ]]; then
+    echo "[!] 未找到 ${SYSTEMD_SERVICE}，跳过 User=root 修补"
+    return
+  fi
+
+  if grep -q '^User=root$' "${SYSTEMD_SERVICE}"; then
+    echo "[*] xray.service 已经是 User=root"
+    return
+  fi
+
+  cp -a "${SYSTEMD_SERVICE}" "${SYSTEMD_SERVICE}.bak_$(date +%Y%m%d_%H%M%S)"
+
+  if grep -q '^User=nobody$' "${SYSTEMD_SERVICE}"; then
+    sed -i 's/^User=nobody$/User=root/' "${SYSTEMD_SERVICE}"
+    echo "[*] 已将 xray.service 中的 User=nobody 改为 User=root"
+  elif grep -q '^User=' "${SYSTEMD_SERVICE}"; then
+    sed -i 's/^User=.*/User=root/' "${SYSTEMD_SERVICE}"
+    echo "[*] 已将 xray.service 中的 User=... 改为 User=root"
+  else
+    awk '
+      BEGIN { inserted=0 }
+      /^\[Service\]/ {
+        print
+        print "User=root"
+        inserted=1
+        next
+      }
+      { print }
+      END {
+        if (inserted==0) {
+          print "[Service]"
+          print "User=root"
+        }
+      }
+    ' "${SYSTEMD_SERVICE}" > "${SYSTEMD_SERVICE}.tmp"
+    mv "${SYSTEMD_SERVICE}.tmp" "${SYSTEMD_SERVICE}"
+    echo "[*] 已向 xray.service 写入 User=root"
+  fi
 }
 
 get_public_ip() {
@@ -80,7 +129,8 @@ gen_uuid() {
 
 # 兼容新旧 xray x25519 输出：
 # 旧：Private key / Public key
-# 新：PrivateKey / Password / Hash32  (Password 作为 publicKey 使用)
+# 新：PrivateKey / Password / Hash32
+# 其中 Password 可作为客户端 public key 使用
 gen_reality_keys() {
   local out priv pub
   out="$("${XRAY_BIN}" x25519 || true)"
@@ -168,7 +218,8 @@ EOF
   echo "[*] 写入服务端配置：${CFG_FILE}"
 
   if ! "${XRAY_BIN}" run -test -config "${CFG_FILE}" >/dev/null 2>&1; then
-    echo "[!] 配置校验失败，但 config 已写入。查看：journalctl -u xray -n 200 --no-pager"
+    echo "[!] 配置校验失败，但 config 已写入：${CFG_FILE}"
+    echo "    查看错误：journalctl -u xray -n 200 --no-pager"
   else
     echo "[*] 配置校验通过"
   fi
@@ -176,6 +227,7 @@ EOF
 
 setup_firewall() {
   echo "[*] 放行端口 ${PORT}/tcp（尽量不破坏你现有策略）..."
+
   if have_cmd ufw; then
     local s
     s="$(ufw status 2>/dev/null | head -n 1 || true)"
@@ -186,6 +238,7 @@ setup_firewall() {
       echo "    - UFW: 未启用（跳过）"
     fi
   fi
+
   if have_cmd iptables; then
     if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1; then
       iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 || true
@@ -194,11 +247,15 @@ setup_firewall() {
       echo "    - iptables: 规则已存在（跳过）"
     fi
   fi
+
   echo "[!] 云服务器记得在【云安全组】也放行 ${PORT}/tcp"
 }
 
 restart_xray() {
-  echo "[*] 重启并设置开机自启..."
+  echo "[*] 修补 xray.service 为 User=root ..."
+  patch_xray_service_user_root
+
+  echo "[*] 重载并重启 xray ..."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
@@ -230,7 +287,7 @@ FLOW="${FLOW}"
 SHORT_ID="${shortid}"
 REALITY_PUBLIC_KEY="${pub}"
 
-# Inbound tag (only operate this inbound)
+# Inbound tag
 INBOUND_TAG="reality-in"
 EOF
 
@@ -270,13 +327,11 @@ UUID="$(xray uuid)"
 mkdir -p "${CLIENT_DIR}"
 chmod 700 "${CLIENT_DIR}"
 
-# 确认 inbound tag 存在
 if ! jq -e --arg tag "${INBOUND_TAG}" '.inbounds[] | select(.tag==$tag)' "${XRAY_CONFIG}" >/dev/null; then
   echo "[!] 未找到 tag=${INBOUND_TAG} 的 inbound，拒绝修改。"
   exit 1
 fi
 
-# 防重复 email
 if jq -e --arg tag "${INBOUND_TAG}" --arg email "${NAME}" '
   .inbounds[]
   | select(.tag==$tag)
@@ -310,6 +365,7 @@ rm -f "${TMP}"
 systemctl restart xray
 echo "[+] Server config updated & reloaded"
 
+# ---------- xray/v2ray 客户端 JSON ----------
 CLIENT_JSON="${CLIENT_DIR}/${NAME}.json"
 cat > "${CLIENT_JSON}" <<EOF2
 {
@@ -356,6 +412,7 @@ EOF2
 chmod 600 "${CLIENT_JSON}"
 echo "[+] Client config written: ${CLIENT_JSON}"
 
+# ---------- VLESS URL ----------
 VLESS_URL="vless://${UUID}@${SERVER_IP}:${PORT}?type=tcp&security=reality&flow=${FLOW}&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&sni=${DOMAIN}#${NAME}"
 
 echo
@@ -368,6 +425,77 @@ echo "${VLESS_URL}" > "${URL_FILE}"
 chmod 600 "${URL_FILE}"
 echo "[+] URL file generated: ${URL_FILE}"
 
+# ---------- Clash YAML ----------
+CLASH_YAML="${CLIENT_DIR}/${NAME}.yaml"
+cat > "${CLASH_YAML}" <<EOF2
+proxies:
+  - name: "${NAME}"
+    type: vless
+    server: ${SERVER_IP}
+    port: ${PORT}
+    uuid: ${UUID}
+    network: tcp
+    tls: true
+    udp: true
+    servername: ${DOMAIN}
+    flow: ${FLOW}
+    reality-opts:
+      public-key: ${REALITY_PUBLIC_KEY}
+      short-id: ${SHORT_ID}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "${NAME}"
+      - DIRECT
+
+rules:
+  - MATCH,PROXY
+EOF2
+chmod 600 "${CLASH_YAML}"
+echo "[+] Clash YAML generated: ${CLASH_YAML}"
+
+# ---------- sing-box JSON ----------
+SINGBOX_JSON="${CLIENT_DIR}/${NAME}.singbox.json"
+cat > "${SINGBOX_JSON}" <<EOF2
+{
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 10808
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "${SERVER_IP}",
+      "server_port": ${PORT},
+      "uuid": "${UUID}",
+      "flow": "${FLOW}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "reality": {
+          "enabled": true,
+          "public_key": "${REALITY_PUBLIC_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
+      }
+    }
+  ]
+}
+EOF2
+chmod 600 "${SINGBOX_JSON}"
+echo "[+] sing-box config generated: ${SINGBOX_JSON}"
+
+# ---------- QR ----------
 QR_FILE="${CLIENT_DIR}/${NAME}.png"
 qrencode -o "${QR_FILE}" "${VLESS_URL}"
 
@@ -433,7 +561,6 @@ NAME="$1"
 KEEP_FILES="0"
 [[ "${2:-}" == "--keep-files" ]] && KEEP_FILES="1"
 
-# 是否存在
 if ! jq -e --arg tag "${INBOUND_TAG}" --arg email "${NAME}" '
   any(.inbounds[] | select(.tag==$tag) | .settings.clients[]?; (.email? == $email))
 ' "${XRAY_CONFIG}" >/dev/null; then
@@ -465,10 +592,13 @@ echo "[+] 已删除用户 email=${NAME} 并重启 xray"
 
 if [[ "${KEEP_FILES}" == "0" ]]; then
   if [[ -n "${CLIENT_DIR:-}" && -d "${CLIENT_DIR}" ]]; then
-    rm -f "${CLIENT_DIR}/${NAME}.json" \
-          "${CLIENT_DIR}/${NAME}.url" \
-          "${CLIENT_DIR}/${NAME}.png" || true
-    echo "[+] 已清理客户端文件（如存在）：${CLIENT_DIR}/${NAME}.{json,url,png}"
+    rm -f \
+      "${CLIENT_DIR}/${NAME}.json" \
+      "${CLIENT_DIR}/${NAME}.url" \
+      "${CLIENT_DIR}/${NAME}.png" \
+      "${CLIENT_DIR}/${NAME}.yaml" \
+      "${CLIENT_DIR}/${NAME}.singbox.json" || true
+    echo "[+] 已清理客户端文件（如存在）"
   else
     echo "[!] CLIENT_DIR 未设置或不存在，跳过客户端文件清理"
   fi
@@ -511,11 +641,10 @@ main() {
   shortid="$(rand_shortid)"
 
   write_server_config "${admin_uuid}" "${priv}" "${shortid}"
-  setup_firewall
-  restart_xray
-
   write_reality_env "${server_ip}" "${shortid}" "${pub}"
   install_tool_scripts
+  setup_firewall
+  restart_xray
 
   echo
   echo "================= 初始化完成 ================="
@@ -534,7 +663,7 @@ main() {
   echo "  SNI         : ${SNI_HOST}"
   echo "  FLOW        : ${FLOW}"
   echo "  SHORT_ID    : ${shortid}"
-  echo "  PUBLIC_KEY  : ${pub}   (新 Xray 输出里通常来自 Password 字段)"
+  echo "  PUBLIC_KEY  : ${pub}"
   echo "============================================="
 }
 

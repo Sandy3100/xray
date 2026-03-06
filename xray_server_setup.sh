@@ -439,6 +439,7 @@ proxies:
     udp: true
     servername: ${DOMAIN}
     flow: ${FLOW}
+    client-fingerprint: chrome
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
       short-id: ${SHORT_ID}

@@ -111,7 +111,6 @@ get_public_ip() {
   [[ -n "${ip}" ]] || ip="$(curl -4s --max-time 3 https://ifconfig.me || true)"
   [[ -n "${ip}" ]] || ip="$(curl -4s --max-time 3 https://ipv4.icanhazip.com || true)"
   ip="$(echo "${ip}" | tr -d ' \r\n')"
-  [[ -n "${ip}" ]] || ip="UNKNOWN_PUBLIC_IP"
   echo "${ip}"
 }
 
@@ -168,6 +167,8 @@ backup_if_exists() {
     ts="$(date +%Y%m%d_%H%M%S)"
     cp -a "${f}" "${f}.bak_${ts}"
     echo "[*] 备份 -> ${f}.bak_${ts}"
+    # 只保留最近 3 个备份，防止含私钥的备份无限堆积
+    ls -t "${f}.bak_"* 2>/dev/null | tail -n +4 | xargs -r rm -f
   fi
 }
 
@@ -218,11 +219,11 @@ EOF
   echo "[*] 写入服务端配置：${CFG_FILE}"
 
   if ! "${XRAY_BIN}" run -test -config "${CFG_FILE}" >/dev/null 2>&1; then
-    echo "[!] 配置校验失败，但 config 已写入：${CFG_FILE}"
-    echo "    查看错误：journalctl -u xray -n 200 --no-pager"
-  else
-    echo "[*] 配置校验通过"
+    echo "[!] 配置校验失败：${CFG_FILE}"
+    echo "    查看错误：${XRAY_BIN} run -test -config ${CFG_FILE}"
+    exit 1
   fi
+  echo "[*] 配置校验通过"
 }
 
 setup_firewall() {
@@ -347,6 +348,11 @@ echo "[+] New Reality client: ${NAME}"
 echo "[+] UUID: ${UUID}"
 echo "======================================"
 
+# 并发写保护
+LOCK_FILE="${XRAY_CONFIG}.lock"
+exec 9>"${LOCK_FILE}"
+flock -x 9
+
 TMP="$(mktemp)"
 jq --arg tag "${INBOUND_TAG}" --arg id "${UUID}" --arg flow "${FLOW}" --arg email "${NAME}" '
   .inbounds |= map(
@@ -361,6 +367,8 @@ jq --arg tag "${INBOUND_TAG}" --arg id "${UUID}" --arg flow "${FLOW}" --arg emai
 jq empty "${TMP}"
 cp "${TMP}" "${XRAY_CONFIG}"
 rm -f "${TMP}"
+
+flock -u 9
 
 systemctl restart xray
 echo "[+] Server config updated & reloaded"
@@ -439,6 +447,9 @@ proxies:
     udp: true
     servername: ${DOMAIN}
     flow: ${FLOW}
+    alpn:
+      - h2
+      - http/1.1
     client-fingerprint: chrome
     reality-opts:
       public-key: ${REALITY_PUBLIC_KEY}
@@ -489,8 +500,18 @@ cat > "${SINGBOX_JSON}" <<EOF2
           "short_id": "${SHORT_ID}"
         }
       }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
     }
-  ]
+  ],
+  "route": {
+    "rules": [
+      { "geoip": ["cn", "private"], "outbound": "direct" }
+    ],
+    "final": "proxy"
+  }
 }
 EOF2
 chmod 600 "${SINGBOX_JSON}"
@@ -498,18 +519,22 @@ echo "[+] sing-box config generated: ${SINGBOX_JSON}"
 
 # ---------- QR ----------
 QR_FILE="${CLIENT_DIR}/${NAME}.png"
-qrencode -o "${QR_FILE}" "${VLESS_URL}"
-
-echo
-echo "[+] QR code file: ${QR_FILE}"
-echo "[+] QR code (terminal):"
-echo
-qrencode -t UTF8 -s 2 "${VLESS_URL}"
+if qrencode -o "${QR_FILE}" "${VLESS_URL}" 2>/dev/null && [[ -s "${QR_FILE}" ]]; then
+  echo
+  echo "[+] QR code file: ${QR_FILE}"
+  echo "[+] QR code (terminal):"
+  echo
+  qrencode -t UTF8 -s 2 "${VLESS_URL}" || true
+else
+  echo "[!] QR code 生成失败（qrencode 错误或输出为空），跳过"
+fi
 
 echo
 echo "[✓] Done."
 EOF
-  chmod +x "${ADD_USER_BIN}"
+  # 修正 reality.env 路径（脚本内用占位符，此处替换为实际路径）
+  sed -i "s|/usr/local/etc/xray/reality.env|${REALITY_ENV}|g" "${ADD_USER_BIN}"
+  chmod 700 "${ADD_USER_BIN}"
 
   # ---------- list-users ----------
   cat > "${LIST_USER_BIN}" <<'EOF'
@@ -538,7 +563,8 @@ jq -r --arg tag "${INBOUND_TAG}" '
 
 echo "========================================================"
 EOF
-  chmod +x "${LIST_USER_BIN}"
+  sed -i "s|/usr/local/etc/xray/reality.env|${REALITY_ENV}|g" "${LIST_USER_BIN}"
+  chmod 700 "${LIST_USER_BIN}"
 
   # ---------- del-user ----------
   cat > "${DEL_USER_BIN}" <<'EOF'
@@ -569,9 +595,15 @@ if ! jq -e --arg tag "${INBOUND_TAG}" --arg email "${NAME}" '
   exit 1
 fi
 
+LOCK_FILE="${XRAY_CONFIG}.lock"
+exec 9>"${LOCK_FILE}"
+flock -x 9
+
 ts="$(date +%Y%m%d_%H%M%S)"
 cp -a "${XRAY_CONFIG}" "${XRAY_CONFIG}.bak_${ts}"
 echo "[*] 已备份配置 -> ${XRAY_CONFIG}.bak_${ts}"
+# 只保留最近 3 个备份
+ls -t "${XRAY_CONFIG}.bak_"* 2>/dev/null | tail -n +4 | xargs -r rm -f
 
 TMP="$(mktemp)"
 jq --arg tag "${INBOUND_TAG}" --arg email "${NAME}" '
@@ -587,6 +619,8 @@ jq --arg tag "${INBOUND_TAG}" --arg email "${NAME}" '
 jq empty "${TMP}"
 cp "${TMP}" "${XRAY_CONFIG}"
 rm -f "${TMP}"
+
+flock -u 9
 
 systemctl restart xray
 echo "[+] 已删除用户 email=${NAME} 并重启 xray"
@@ -609,7 +643,8 @@ fi
 
 echo "[✓] Done."
 EOF
-  chmod +x "${DEL_USER_BIN}"
+  sed -i "s|/usr/local/etc/xray/reality.env|${REALITY_ENV}|g" "${DEL_USER_BIN}"
+  chmod 700 "${DEL_USER_BIN}"
 
   echo "[*] 工具脚本已生成："
   echo "    - ${ADD_USER_BIN}"
@@ -625,6 +660,10 @@ main() {
   echo "[*] 获取公网 IP..."
   local server_ip
   server_ip="$(get_public_ip)"
+  if [[ -z "${server_ip}" ]]; then
+    echo "[!] 无法获取公网 IP，请手动指定：SERVER_IP=1.2.3.4 bash $0"
+    exit 1
+  fi
   echo "[*] SERVER_IP=${server_ip}"
 
   echo "[*] 生成 admin UUID..."
@@ -640,6 +679,11 @@ main() {
   echo "[*] 生成 shortId..."
   local shortid
   shortid="$(rand_shortid)"
+
+  case "${FLOW}" in
+    xtls-rprx-vision|xtls-rprx-vision-udp443|"") ;;
+    *) echo "[!] 无效的 FLOW 值：${FLOW}，支持 xtls-rprx-vision / xtls-rprx-vision-udp443"; exit 1 ;;
+  esac
 
   write_server_config "${admin_uuid}" "${priv}" "${shortid}"
   write_reality_env "${server_ip}" "${shortid}" "${pub}"
